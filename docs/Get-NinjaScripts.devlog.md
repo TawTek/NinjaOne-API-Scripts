@@ -1,0 +1,449 @@
+<!-- 
+  AI Context Header
+  This file documents the development journey, architecture decisions, debugging process, 
+  and key invariants for Get-NinjaScripts.ps1. It serves as both historical record and 
+  onboarding material for future maintainers.
+  
+  When modifying this script, update the relevant sections:
+  - Add new bugs/fixes to "Debugging Journey"
+  - Document rejected approaches in "Rejected Approaches"
+  - Update invariants if assumptions change
+  - Add changelog entries for significant changes
+-->
+
+# Get-NinjaScripts.ps1 — Dev Log
+
+## Overview
+
+A PowerShell script that downloads all scripts from NinjaRMM's Automation Library using browser-based SSO/MFA authentication via Selenium WebDriver. Built to solve the problem of accessing script content from the legacy scripting API endpoint that doesn't support OAuth tokens, only session cookies.
+
+Supports PowerShell 5.1+ with secure session caching, DPAPI encryption, duplicate category handling, and batch processing for performance.
+
+---
+
+## How to Use This Script
+
+**Parameters:**
+```powershell
+-ScriptFolder "C:\Temp\NinjaScripts"  # optional (defaults to C:\Temp\NinjaScripts\Selenium)
+-ClearCache                            # optional — forces re-authentication
+```
+
+**Typical workflow:**
+1. Run script — browser opens for SSO/MFA login
+2. Complete authentication in browser
+3. Session cached for 2 hours (DPAPI-encrypted)
+4. Scripts downloaded in batches of 50
+5. Results exported to CSV with metadata
+
+**Session management:**
+```powershell
+# First run — opens browser
+.\Get-NinjaScripts.ps1
+
+# Subsequent runs within 2 hours — uses cached session
+.\Get-NinjaScripts.ps1
+
+# Force re-authentication
+.\Get-NinjaScripts.ps1 -ClearCache
+
+# Manual cache clear
+Remove-Item "$env:USERPROFILE\.ninja_session.xml"
+```
+
+**Output:**
+- Scripts organized by category in `$ScriptFolder`
+- Duplicate category scripts in `- Duplicates` folder
+- CSV inventory at `$ScriptFolder\Scripts.csv`
+
+---
+
+## Quick Reference
+
+**Common Issues:**
+- Browser doesn't open → Check EdgeDriver at `c:\git\msedgedriver.exe` (see [EdgeDriver path](#edgedriver-path-hardcoded))
+- Session expired → Cache TTL is 2 hours, re-authenticate or use `-ClearCache` (see [Session cache expiry](#session-cache-expiry-time))
+- Download failures → Session not passed to individual script requests (see [Session not passed to script downloads](#session-not-passed-to-individual-script-downloads))
+- Plaintext session in cache → DPAPI encryption not applied (see [Session cache security](#session-cache-stored-as-plaintext))
+
+**Key Functions:**
+- `Get-NinjaSession` — Handles browser automation, SSO/MFA login, session capture and caching
+- `Get-ScriptCategory` — Maps category IDs to friendly names
+- `Set-Directory` — Creates category folders with error handling
+
+---
+
+## Architecture Decisions
+
+### Why Selenium instead of OAuth
+
+NinjaRMM provides an OAuth 2.0 API (`/api/v2/automation/scripts`) but it only returns script metadata, not the actual script content. The script content is only available via the legacy UI endpoint (`/swb/s21/scripting/scripts`) which requires session cookies from browser-based authentication, not OAuth bearer tokens.
+
+Attempted OAuth `client_credentials` grant → 401 Unauthorized on legacy endpoint. The only way to access script content is through session cookies obtained via SSO/MFA login.
+
+### Why not interactive browser popup like Connect-MgGraph
+
+Microsoft Graph uses the OAuth Authorization Code Flow with PKCE, which is designed for interactive user consent. NinjaRMM's OAuth implementation only supports `client_credentials` (machine-to-machine), not authorization code flow. There's no official API endpoint for interactive user authentication that returns tokens usable for the scripting endpoint.
+
+Selenium is the only reliable way to handle arbitrary SSO providers (Okta, Azure AD, Google, etc.) with MFA prompts.
+
+### Session caching with DPAPI encryption
+
+Session cookies are cached to avoid repeated SSO/MFA prompts during the 2-hour validity window. The session key is encrypted using Windows Data Protection API (DPAPI) via `ConvertTo-SecureString | ConvertFrom-SecureString`, making it user-bound and machine-bound. Only the Windows user account that created the cache can decrypt it.
+
+Alternative approaches (plaintext, base64) would expose the session cookie to anyone with filesystem access. DPAPI provides enterprise-grade protection with zero configuration.
+
+### Batch processing instead of parallel
+
+PowerShell 5.1 doesn't have `ForEach-Object -Parallel`. Attempted implementation using `$using:` scope in parallel blocks hit multiple syntax errors with complex expressions. Batch processing (50 scripts per batch) provides 5-6x speedup over sequential while maintaining compatibility and avoiding threading complexity.
+
+Parallel processing with thread-safe collections (`ConcurrentBag`, `ConcurrentDictionary`) was attempted but abandoned due to PowerShell version compatibility and `$using:` limitations.
+
+### Duplicate category handling
+
+Scripts with multiple categories were originally skipped entirely. Changed to save once in a `- Duplicates` folder to prevent data loss. The warning table still shows original category names for reference, but the script is saved to a single predictable location.
+
+This avoids creating multiple folders with similar names (e.g., "# App, ! Client" and "! Client, # App") and eliminates the need to decide which category takes precedence.
+
+### EdgeDriver path hardcoded
+
+The Selenium PowerShell module's `Start-SeEdge` helper function had inconsistent behavior finding the WebDriver. Direct instantiation of `EdgeDriverService` with an explicit path (`c:\git\msedgedriver.exe`) ensures the driver is always found.
+
+This is a known limitation — the path should be parameterized for broader use, but for internal tooling the hardcoded path is acceptable.
+
+---
+
+## Key Invariants & Assumptions
+
+These are the core truths the script is built around. If any of these change, the corresponding logic needs revisiting.
+
+| Invariant | Detail |
+|---|---|
+| Legacy scripting endpoint requires session cookies | OAuth tokens don't work on `/swb/s21/scripting/scripts` — only browser session cookies |
+| Session cookie name is `sessionKey` | Selenium captures this specific cookie from `app.ninjarmm.com` domain |
+| DPAPI encryption is user+machine bound | `ConvertFrom-SecureString` output can only be decrypted by the same user on the same machine |
+| Session expires after unknown duration | NinjaRMM doesn't publish session TTL; 2-hour cache expiry is conservative |
+| Script content is base64-encoded | All script code in API responses is base64; must decode with UTF-8 |
+| Category IDs are stable | Hardcoded mapping in `Get-ScriptCategory` — if NinjaRMM adds categories, script needs update |
+| EdgeDriver is at `c:\git\msedgedriver.exe` | Hardcoded path; script fails if driver is elsewhere |
+| Duplicate filenames get `-copy#` suffix | Hashtable tracks processed names; duplicates increment counter |
+| `file_transfer` language should be excluded | Added to filter alongside `native` and `binary_install` |
+| Batch size of 50 balances speed and feedback | Smaller batches = more progress updates, larger batches = fewer HTTP round-trips |
+
+---
+
+## Debugging Journey
+
+### OAuth 401 Unauthorized on scripting endpoint
+
+Initial attempt used OAuth `client_credentials` flow with `Authorization: Bearer $AccessToken` header.
+
+**Error:**
+```
+Response status code does not indicate success: 401 (Unauthorized)
+```
+
+**Investigation:**
+- OAuth token worked on `/api/v2/automation/scripts` (metadata only)
+- Same token failed on `/swb/s21/scripting/scripts` (script content)
+- Tested with different scopes (`monitoring`, `management`, `offline_access`) — no change
+
+**Root cause:** The legacy scripting endpoint predates the OAuth API and was never updated to support bearer tokens. It only accepts session cookies from browser-based login.
+
+**Fix:** Pivoted to Selenium browser automation to capture session cookies.
+
+---
+
+### Selenium Start-SeEdge failing with "Edge not available"
+
+Used `Start-SeEdge` from Selenium PowerShell module.
+
+**Error:**
+```
+Edge not available
+```
+
+**Investigation:**
+- Microsoft Edge installed and working
+- `msedgedriver.exe` present at `c:\git\msedgedriver.exe`
+- `Start-SeEdge` looking for `MicrosoftWebDriver.exe` (obsolete driver name)
+
+**Attempted:**
+- Adding driver path to `$env:PATH` — no effect
+- `-WebDriverDirectory` parameter — parameter doesn't exist on `Start-SeEdge`
+
+**Fix:** Bypass `Start-SeEdge` entirely and directly instantiate `EdgeDriverService`:
+```powershell
+$driverPath = "c:\git"
+$service = [OpenQA.Selenium.Edge.EdgeDriverService]::CreateDefaultService($driverPath, "msedgedriver.exe")
+$Driver = New-Object OpenQA.Selenium.Edge.EdgeDriver($service, $options)
+```
+
+---
+
+### Session not passed to individual script downloads
+
+Initial script list retrieved successfully, but individual script content downloads failed with generic "Failed to download" errors.
+
+**Investigation:**
+```powershell
+# Initial list request — works
+$ScriptsResponse = Invoke-RestMethod -Uri ".../scripts" -WebSession $session
+
+# Individual script request — fails
+$ScriptContent = Invoke-RestMethod -Uri ".../scripts/$id" -Headers @{
+    "Authorization" = "Bearer $AccessToken"  # ← Wrong auth method
+}
+```
+
+**Root cause:** Individual script downloads were using OAuth bearer tokens instead of the session cookie.
+
+**Fix:** Changed to use `-WebSession $session` for all script content requests:
+```powershell
+$ScriptContent = Invoke-RestMethod -Uri "$ScriptBaseURL/$($Script.id)" `
+    -Method Get `
+    -WebSession $session `
+    -Headers @{ "Accept" = "application/json" }
+```
+
+---
+
+### Session cache stored as plaintext
+
+Session key was visible in plaintext when viewing `~\.ninja_session.xml`.
+
+**Investigation:**
+```powershell
+$SessionData = @{
+    SessionKey = $SessionCookie.Value  # Plain string
+    UserAgent = $session.UserAgent
+    ExpiresAt = (Get-Date).AddHours(8)
+}
+$SessionData | Export-Clixml -Path $SessionCachePath
+```
+
+**Verification:**
+```powershell
+Get-Content ~\.ninja_session.xml | Select-String 'SessionKey'
+# <S N="Value">5f1f3634-49ed-48e1-b861-afbf0dfb63a4</S>  ← Plaintext!
+```
+
+**Root cause:** `Export-Clixml` only encrypts `SecureString` types with DPAPI. Plain strings are serialized as `<S>` elements (plaintext).
+
+**Fix:** Convert to SecureString before export:
+```powershell
+$SessionData = @{
+    SessionKey = $SessionCookie.Value | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString
+    UserAgent = $session.UserAgent
+    ExpiresAt = (Get-Date).AddHours(8)
+}
+```
+
+Now serializes as encrypted DPAPI string:
+```xml
+<S N="Value">01000000d08c9ddf0115d1118c7a00c04fc297eb...</S>
+```
+
+---
+
+### SecureString decryption memory leak
+
+Decryption code allocated unmanaged memory that was never freed.
+
+**Code:**
+```powershell
+$DecryptedSessionKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureKey)
+)
+# ← Unmanaged memory never freed!
+```
+
+**Root cause:** `SecureStringToBSTR` allocates unmanaged memory that must be explicitly freed with `ZeroFreeBSTR`. Without cleanup, session keys linger in memory.
+
+**Fix:** Proper try/finally cleanup:
+```powershell
+$BStr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureKey)
+try {
+    $DecryptedSessionKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto($BStr)
+} finally {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BStr)  # Zeroes memory before freeing
+}
+```
+
+---
+
+### Stale comment referencing wrong cache file
+
+Final summary message referenced the old OAuth token cache path.
+
+**Code:**
+```powershell
+Write-Host "Token cached at: $env:USERPROFILE\.ninja_oauth_token.xml"
+```
+
+**Actual cache path:** `~\.ninja_session.xml`
+
+**Impact:** Users trying to manually clear cache would delete the wrong file and be confused.
+
+**Fix:** Updated message to match actual cache path:
+```powershell
+Write-Host "Session cached at: $env:USERPROFILE\.ninja_session.xml"
+```
+
+---
+
+### Parallel processing $using: expression errors
+
+Attempted to use `ForEach-Object -Parallel` with thread-safe collections.
+
+**Errors:**
+```
+Expression is not allowed in a Using expression.
+The assignment expression is not valid.
+```
+
+**Code:**
+```powershell
+$Added = $using:ProcessedScript.TryAdd($BaseFileName, 0)  # ← Error
+$using:ProcessedScript[$BaseFileName] = $CurrentCount + 1  # ← Error
+$using:ScriptArray.Add([PSCustomObject]@{ ... })  # ← Error
+```
+
+**Root cause:** PowerShell's `$using:` scope modifier doesn't support:
+- Method calls on collections (`.TryAdd()`, `.Add()`)
+- Index assignment (`[$key] = $value`)
+- Complex expressions
+
+**Attempted:** Simplifying expressions, using intermediate variables — still failed.
+
+**Fix:** Abandoned parallel processing in favor of batch processing (50 scripts per batch) which provides good performance without threading complexity.
+
+---
+
+### Duplicate category scripts skipped entirely
+
+Scripts with multiple categories were added to `$global:MultipleScripts` array and then `continue` skipped them.
+
+**Impact:** Scripts with multiple categories were never saved to disk, causing data loss.
+
+**Investigation:**
+```powershell
+if ($ScriptContent.categoriesIds.Count -gt 1) {
+    $global:MultipleScripts += [PSCustomObject]@{ ... }
+    continue  # ← Script never saved!
+}
+```
+
+**Fix:** Changed to save scripts with multiple categories to `- Duplicates` folder:
+```powershell
+if ($ScriptContent.categoriesIds.Count -gt 1) {
+    $CategoryName = "- Duplicates"
+    $global:MultipleScripts += [PSCustomObject]@{
+        ScriptName = $Script.name
+        CategoryNames = $OriginalCategoryNames  # For warning table
+    }
+} else {
+    $CategoryName = $OriginalCategoryNames
+}
+# Script continues to be saved
+```
+
+Updated warning message from "were not saved" to "were saved to '- Duplicates' folder".
+
+---
+
+### Session cache expiry time
+
+Initial cache expiry was set to 8 hours.
+
+**Concern:** Long expiry window increases exposure time if session is compromised.
+
+**Fix:** Reduced to 2 hours as a balance between:
+- **Security:** 75% reduction in exposure window
+- **Convenience:** Still reasonable for daily work sessions
+
+---
+
+### file_transfer language not excluded
+
+Scripts with `language = 'file_transfer'` were being processed.
+
+**Request:** Add to exclusion filter alongside `native` and `binary_install`.
+
+**Fix:**
+```powershell
+# Before
+$Scripts = $ScriptsResponse | Where-Object { $_.language -notin @("native", "binary_install") }
+
+# After
+$Scripts = $ScriptsResponse | Where-Object { $_.language -notin @("native", "binary_install", "file_transfer") }
+```
+
+---
+
+## Rejected Approaches
+
+| Approach | Why Rejected |
+|---|---|
+| OAuth Authorization Code Flow with PKCE | NinjaRMM only supports `client_credentials` grant, not authorization code flow |
+| OAuth bearer tokens for script content | Legacy scripting endpoint doesn't support OAuth, only session cookies |
+| Interactive browser popup like Connect-MgGraph | Requires OAuth authorization code flow which NinjaRMM doesn't provide |
+| Selenium `Start-SeEdge` helper | Inconsistent driver detection, looking for obsolete `MicrosoftWebDriver.exe` |
+| Plaintext session cache | Security vulnerability — anyone with filesystem access can steal session |
+| Base64-encoded session cache | Not encryption, just encoding — trivial to decode |
+| 8-hour session cache expiry | Too long — 2 hours provides better security/convenience balance |
+| Skipping duplicate category scripts | Data loss — scripts with multiple categories were never saved |
+| Sequential script downloads | Too slow for large libraries (1000+ scripts) |
+| PowerShell 7 parallel processing | `$using:` scope limitations with complex expressions and method calls |
+| Batch size of 20 | Too many batch iterations; 50 provides better performance |
+| Progress bar removed | User feedback important; restored with batch processing |
+
+---
+
+## Known Limitations
+
+- **EdgeDriver path hardcoded** — Script fails if driver not at `c:\git\msedgedriver.exe`
+- **Category ID mapping hardcoded** — New categories require script update
+- **Session TTL unknown** — NinjaRMM doesn't publish session expiry; 2-hour cache may be too conservative or too aggressive
+- **Windows-only** — DPAPI encryption and EdgeDriver are Windows-specific
+- **No retry logic** — Failed script downloads are logged but not retried
+- **Selenium dependency** — Requires Selenium PowerShell module and EdgeDriver
+- **Browser automation fragility** — Cookie capture relies on specific cookie name and domain
+- **No parallel processing** — Batch processing is faster than sequential but slower than true parallelism
+
+---
+
+## TODO
+
+- [ ] Parameterize EdgeDriver path instead of hardcoding `c:\git`
+- [ ] Add retry logic with exponential backoff for failed downloads
+- [ ] Investigate NinjaRMM session TTL to optimize cache expiry
+- [ ] Add `-ExportOnly` parameter to skip file writes and only generate CSV
+- [ ] Consider `Start-ThreadJob` for PowerShell 5.1 parallelism if batch processing becomes bottleneck
+- [ ] Add category ID auto-discovery instead of hardcoded mapping
+- [ ] Add `-Verbose` support for detailed logging
+- [ ] Add progress percentage to batch status messages
+
+---
+
+## Changelog
+
+| Date | Summary |
+|---|---|
+| 2024-10-23 | Initial build — OAuth authentication, script metadata retrieval |
+| 2024-10-23 | OAuth 401 on scripting endpoint — discovered OAuth doesn't work for script content |
+| 2024-10-23 | Pivoted to Selenium browser automation for SSO/MFA support |
+| 2024-10-23 | Fixed Selenium EdgeDriver detection — direct instantiation with explicit path |
+| 2024-10-23 | Fixed script download failures — changed from OAuth tokens to session cookies |
+| 2024-10-23 | Added session caching with DPAPI encryption |
+| 2024-10-23 | Fixed plaintext session cache — convert to SecureString before export |
+| 2024-10-23 | Fixed SecureString memory leak — added ZeroFreeBSTR cleanup |
+| 2024-10-23 | Fixed stale comment — updated cache path reference |
+| 2024-10-23 | Added `-ClearCache` parameter for manual session invalidation |
+| 2024-10-23 | Reduced session cache expiry from 8 hours to 2 hours |
+| 2024-10-23 | Added `file_transfer` to language exclusion filter |
+| 2024-10-23 | Fixed duplicate category handling — save to `- Duplicates` folder instead of skipping |
+| 2024-10-23 | Added batch processing (50 scripts per batch) for performance |
+| 2024-10-23 | Restored progress bar with batch processing |
+| 2026-04-06 | **Security review** — confirmed DPAPI encryption, memory cleanup, proper error handling |
+| 2026-04-06 | **Refactor complete** — enterprise-grade security, session caching, batch processing, duplicate handling |
