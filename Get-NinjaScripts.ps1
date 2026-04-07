@@ -18,7 +18,7 @@ Supports: Edge or Chrome browser
 #>
 
 param(
-    [string]$ScriptFolder,
+    [string]$ScriptFolder = "C:\Temp\NinjaScripts",
     [switch]$ClearCache
 )
 
@@ -34,8 +34,6 @@ function Get-NinjaSession {
     
     .PARAMETER ForceClear
     Force clear the cached session
-    
-    .PARAMETER ScreenWidth
     #>
     
     param(
@@ -184,15 +182,18 @@ function Get-NinjaSession {
                 if ($SessionCookie -and $SessionCookie.Value) {
                     Write-Host "Authentication successful! Session captured.`n" -ForegroundColor Green
                     
+                    # Get real UserAgent from browser
+                    $realUserAgent = $Driver.ExecuteScript("return navigator.userAgent")
+                    
                     # Create WebSession and add the cookie
                     $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-                    $session.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+                    $session.UserAgent = $realUserAgent
                     $session.Cookies.Add((New-Object System.Net.Cookie("sessionKey", $SessionCookie.Value, "/", "app.ninjarmm.com")))
                     
                     # Cache the session with DPAPI encryption
                     $SessionData = @{
                         SessionKey = $SessionCookie.Value | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString
-                        UserAgent = $session.UserAgent
+                        UserAgent = $realUserAgent
                         ExpiresAt = (Get-Date).AddHours($CacheExpiryHours)
                     }
                     $SessionData | Export-Clixml -Path $SessionCachePath
@@ -217,15 +218,29 @@ function Get-NinjaSession {
 }
 
 try {
-    # Alternative syntax options:
-    # $session = Get-NinjaSession -ForceClear:$ClearCache           # Colon splatting (concise)
-    # if ($ClearCache) { $session = Get-NinjaSession -ForceClear }   # Conditional (verbose)
-    # $session = Get-NinjaSession @(@{ForceClear=$ClearCache})      # Hashtable splatting
-    
     $session = Get-NinjaSession -ForceClear:$ClearCache
 } catch {
     Write-Host "`nERROR: Authentication failed - $($_.Exception.Message)" -ForegroundColor Red
     exit 1
+}
+
+Write-Host "Fetching categories from NinjaRMM..." -ForegroundColor Cyan
+
+try {
+    $CategoriesResponse = Invoke-RestMethod -Uri "https://app.ninjarmm.com/swb/s21/scripting/categories" `
+        -Method Get `
+        -WebSession $session `
+        -Headers @{
+            "Accept" = "application/json"
+        } `
+        -ErrorAction Stop
+    
+    Write-Host "Successfully retrieved categories!" -ForegroundColor Green
+    
+} catch {
+    Write-Host "WARNING: Failed to fetch categories - $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "Using fallback categories..." -ForegroundColor Yellow
+    $CategoriesResponse = @()
 }
 
 Write-Host "Fetching scripts from NinjaRMM..." -ForegroundColor Cyan
@@ -251,18 +266,25 @@ $Scripts = $ScriptsResponse | Where-Object { $_.language -notin @("native", "bin
 $ScriptBaseURL = "https://app.ninjarmm.com/swb/s21/scripting/scripts"
 $TotalScripts = $Scripts.Count
 
-$global:FailedScripts = @()
-$global:MultipleScripts = @()
-$global:ProcessedScript = @{}
-$global:ScriptArray = @()
-$global:SavedScripts = @()
-
-Write-Host "Processing $TotalScripts scripts..." -ForegroundColor Cyan
-
-# Helper Functions
-function Get-ScriptCategory {
-    param([int[]]$CategoryIDs)
-    
+# Build dynamic categories hash from API response
+$ExcludedCategories = @('Hardware', 'Linux OS Patching', 'Mac OS Patching', 'Maintenance', 'Patching')
+$CategoriesHash = @{}
+if ($CategoriesResponse -and $CategoriesResponse.Count -gt 0) {
+    Write-Host "Building categories from API response ($($CategoriesResponse.Count) categories)..." -ForegroundColor Cyan
+    $ExcludedCount = 0
+    foreach ($Category in $CategoriesResponse) {
+        if ($Category.id -and $Category.name) {
+            # Skip excluded native categories
+            if ($ExcludedCategories -contains $Category.name) {
+                $ExcludedCount++
+                continue
+            }
+            $CategoriesHash[[int]$Category.id] = $Category.name
+        }
+    }
+    Write-Host "Successfully mapped $($CategoriesHash.Count) categories! (Excluded $ExcludedCount native categories)" -ForegroundColor Green
+} else {
+    Write-Host "Using fallback hardcoded categories..." -ForegroundColor Yellow
     $CategoriesHash = @{
         1   = 'Uncategorized'
         8   = '$ WS'
@@ -271,6 +293,16 @@ function Get-ScriptCategory {
         167 = '! Client'
         169 = '$ KF'
     }
+}
+
+Write-Host "Processing $TotalScripts scripts..." -ForegroundColor Cyan
+
+# Helper Functions
+function Get-ScriptCategory {
+    param(
+        [int[]]$CategoryIDs,
+        [hashtable]$CategoriesHash
+    )
     
     $CategoryNames = @()
     foreach ($CategoryID in $CategoryIDs) {
@@ -291,7 +323,7 @@ function Set-Directory {
     if ($Create.IsPresent) {
         if (-not (Test-Path -Path $Path)) {
             try {
-                New-Item -Path $Path -ItemType "Directory" | Out-Null
+                New-Item -Path $Path -ItemType "Directory" -Force | Out-Null
             } catch {
                 Write-Host "ERROR: Failed to create directory. $($_.Exception.Message)" -ForegroundColor Red
             }
@@ -299,30 +331,156 @@ function Set-Directory {
     }
 }
 
-# Download scripts in batches for better performance
-Write-Host "Downloading $TotalScripts scripts in batches of 50 (this will be much faster!)..." -ForegroundColor Cyan
+# Pre-create all category directories to avoid race conditions in parallel mode
+foreach ($CategoryName in $CategoriesHash.Values) {
+    Set-Directory -Path "$ScriptFolder\$CategoryName" -Create
+}
+Set-Directory -Path "$ScriptFolder\- Duplicate-Categories" -Create
 
-# Reset global variables
-$global:ScriptArray = @()
-$global:FailedScripts = @()
-$global:MultipleScripts = @()
-$global:ProcessedScript = @{}
-$global:SavedScripts = @()
-
-# Process scripts in batches of 50 for better performance
-$BatchSize = 50
-$Batches = [Math]::Ceiling($TotalScripts / $BatchSize)
-$CurrentScript = 0
-
-for ($BatchIndex = 0; $BatchIndex -lt $Batches; $BatchIndex++) {
-    $StartIndex = $BatchIndex * $BatchSize
-    $EndIndex = [Math]::Min(($BatchIndex + 1) * $BatchSize - 1, $TotalScripts - 1)
-    $BatchScripts = $Scripts[$StartIndex..$EndIndex]
+# Check PowerShell version and use parallel processing if available
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+    Write-Host "PowerShell 7+ detected - using parallel processing (ThrottleLimit: 20)" -ForegroundColor Green
     
-    Write-Host "Processing batch $($BatchIndex + 1)/$Batches ($($BatchScripts.Count) scripts)..." -ForegroundColor Cyan
+    # Create thread-safe concurrent dictionaries
+    $ProcessedScripts = [System.Collections.Concurrent.ConcurrentDictionary[string,int]]::new()
+    $ProgressCounter = [System.Collections.Concurrent.ConcurrentDictionary[string,int]]::new()
+    $ProgressCounter['completed'] = 0
+    $ProgressCounter['failed'] = 0
     
-    # Process current batch
-    foreach ($Script in $BatchScripts) {
+    $ScriptArray = $Scripts | ForEach-Object -Parallel {
+        $Script = $_
+        $session = $using:session
+        $ScriptBaseURL = $using:ScriptBaseURL
+        $ScriptFolder = $using:ScriptFolder
+        $CategoriesHash = $using:CategoriesHash
+        $ProcessedScripts = $using:ProcessedScripts
+        $ProgressCounter = $using:ProgressCounter
+        $TotalScripts = $using:TotalScripts
+        
+        switch ($Script.language) {
+            'powershell' { $FileExtension = '.ps1' }
+            'batchfile'  { $FileExtension = '.bat' }
+            'vbscript'   { $FileExtension = '.vbs' }
+            'sh'         { $FileExtension = '.sh' }
+            default      { return }
+        }
+        
+        $BaseFileName = (($Script.name -replace '[\\/:*?"<>&|]', '_').TrimStart())
+        
+        # Thread-safe duplicate filename handling
+        $copyNumber = $ProcessedScripts.AddOrUpdate(
+            $BaseFileName,
+            0,
+            { param($key, $oldValue) $oldValue + 1 }
+        )
+        
+        if ($copyNumber -eq 0) {
+            $ScriptFileName = $BaseFileName + $FileExtension
+        } else {
+            $ScriptFileName = "$BaseFileName-copy$copyNumber$FileExtension"
+        }
+        
+        try {
+            $ScriptContent = Invoke-RestMethod -Uri "$ScriptBaseURL/$($Script.id)" `
+                -Method Get `
+                -WebSession $session `
+                -Headers @{
+                    "Accept" = "application/json"
+                } `
+                -ErrorAction Stop
+            
+            # Determine category
+            if ($ScriptContent.categoriesIds -and $ScriptContent.categoriesIds.Count -gt 1) {
+                $CategoryName = "- Duplicate-Categories"
+                $OriginalCategoryNames = @()
+                foreach ($CategoryID in $ScriptContent.categoriesIds) {
+                    if ($CategoriesHash.ContainsKey([int]$CategoryID)) {
+                        $OriginalCategoryNames += $CategoriesHash[[int]$CategoryID]
+                    }
+                }
+                if ($OriginalCategoryNames.Count -eq 0) {
+                    $CategoryNamesStr = "Unknown IDs: $($ScriptContent.categoriesIds -join ', ')"
+                } else {
+                    $CategoryNamesStr = ($OriginalCategoryNames -join ", ")
+                }
+            } elseif ($ScriptContent.categoriesIds -and $ScriptContent.categoriesIds.Count -eq 1) {
+                $CategoryID = [int]$ScriptContent.categoriesIds[0]
+                if ($CategoriesHash.ContainsKey($CategoryID)) {
+                    $CategoryName = $CategoriesHash[$CategoryID]
+                    $CategoryNamesStr = $CategoryName
+                } else {
+                    $CategoryName = 'Uncategorized'
+                    $CategoryNamesStr = "Unknown ID: $CategoryID"
+                }
+            } else {
+                $CategoryName = 'Uncategorized'
+                $CategoryNamesStr = 'Uncategorized'
+            }
+            
+            $ScriptCode = [System.Text.Encoding]::UTF8.GetString(
+                [System.Convert]::FromBase64String($ScriptContent.code)
+            )
+            
+            # Write file immediately - don't store code in memory
+            $FilePath = Join-Path "$ScriptFolder\$CategoryName" $ScriptFileName
+            $WriteSuccess = $false
+            try {
+                $ScriptCode | Set-Content -Path $FilePath -NoNewline -ErrorAction Stop
+                $WriteSuccess = $true
+            } catch {
+                try {
+                    [System.IO.File]::WriteAllText($FilePath, $ScriptCode)
+                    $WriteSuccess = $true
+                } catch {
+                    # Write failed, will be marked as failed
+                }
+            }
+            
+            # Return metadata only (no code)
+            [PSCustomObject]@{
+                Name              = $Script.name
+                Language          = $Script.language
+                Category          = $CategoryName
+                OriginalCategories = $CategoryNamesStr
+                Description       = $Script.description
+                FileName          = $ScriptFileName
+                FilePath          = $FilePath
+                Failed            = -not $WriteSuccess
+                MultiCat          = ($ScriptContent.categoriesIds -and $ScriptContent.categoriesIds.Count -gt 1)
+            }
+        } catch {
+            [PSCustomObject]@{
+                Name     = $Script.name
+                FileName = $ScriptFileName
+                Failed   = $true
+                MultiCat = $false
+            }
+        }
+    } -ThrottleLimit 50 | ForEach-Object {
+        $result = $_
+        if (-not $result.Failed) {
+            $ProgressCounter.AddOrUpdate('completed', 1, { param($k, $v) $v + 1 }) | Out-Null
+        } else {
+            $ProgressCounter.AddOrUpdate('failed', 1, { param($k, $v) $v + 1 }) | Out-Null
+        }
+        $total = $ProgressCounter['completed'] + $ProgressCounter['failed']
+        $percent = [math]::Round(($total / $TotalScripts) * 100)
+        Write-Progress -Activity "Downloading Scripts" `
+            -Status "$total/$TotalScripts | $percent% Complete" `
+            -PercentComplete $percent
+        $result  # pass through — collected into $ScriptArray by the assignment
+    }
+    
+    Write-Progress -Activity "Downloading Scripts" -Completed
+        
+} else {
+    Write-Host "PowerShell 5.1 detected - using sequential processing" -ForegroundColor Yellow
+        
+    $ScriptArray = @()
+    $ProcessedScript = @{}
+    $CurrentScript = 0
+        
+    foreach ($Script in $Scripts) {
         switch ($Script.language) {
             'powershell' { $FileExtension = '.ps1' }
             'batchfile'  { $FileExtension = '.bat' }
@@ -334,17 +492,17 @@ for ($BatchIndex = 0; $BatchIndex -lt $Batches; $BatchIndex++) {
         $BaseFileName = (($Script.name -replace '[\\/:*?"<>&|]', '_').TrimStart())
         $ScriptFileName = $BaseFileName + $FileExtension
         
-        if ($global:ProcessedScript.ContainsKey($BaseFileName)) {
-            $global:ProcessedScript[$BaseFileName]++
-            $ScriptFileName = "$BaseFileName-copy$($global:ProcessedScript[$BaseFileName])$FileExtension"
+        if ($ProcessedScript.ContainsKey($BaseFileName)) {
+            $ProcessedScript[$BaseFileName]++
+            $ScriptFileName = "$BaseFileName-copy$($ProcessedScript[$BaseFileName])$FileExtension"
         } else {
-            $global:ProcessedScript[$BaseFileName] = 0
+            $ProcessedScript[$BaseFileName] = 0
         }
         
         $CurrentScript++
         $PercentComplete = [math]::Round(($CurrentScript / $TotalScripts) * 100)
         Write-Progress -Activity "Downloading Scripts" `
-            -Status "$CurrentScript/$TotalScripts | $PercentComplete% Complete | $ScriptFileName" `
+            -Status "$CurrentScript/$TotalScripts | $PercentComplete% Complete" `
             -PercentComplete $PercentComplete
         
         try {
@@ -356,85 +514,95 @@ for ($BatchIndex = 0; $BatchIndex -lt $Batches; $BatchIndex++) {
                 } `
                 -ErrorAction Stop
             
-            # Get original category names for warning message
-            $OriginalCategoryNames = ((Get-ScriptCategory -CategoryIDs $ScriptContent.categoriesIds) -replace '[\\/:*?"<>|]', '_')
+            $OriginalCategoryNames = ((Get-ScriptCategory -CategoryIDs $ScriptContent.categoriesIds -CategoriesHash $CategoriesHash) -replace '[\\/:*?"<>|]', '_')
             
-            # Handle scripts with multiple categories by using '- Duplicates' folder
             if ($ScriptContent.categoriesIds.Count -gt 1) {
-                $CategoryName = "- Duplicates"
-                $global:MultipleScripts += [PSCustomObject]@{
-                    ScriptName    = $Script.name
-                    CategoryNames = $OriginalCategoryNames
-                }
+                $CategoryName = "- Duplicate-Categories"
             } else {
                 $CategoryName = $OriginalCategoryNames
             }
             
-            Set-Directory -Path "$ScriptFolder\$CategoryName" -Create
-            
             $ScriptCode = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($ScriptContent.code))
             
-            $global:ScriptArray += [PSCustomObject]@{
-                Name = $Script.name
-                Language = $Script.language
-                Category = $CategoryName
-                Description = $Script.description
-                FileName = $ScriptFileName
-                FilePath = Join-Path "$ScriptFolder\$CategoryName" $ScriptFileName
-                Code = $ScriptCode
+            $ScriptArray += [PSCustomObject]@{
+                Name               = $Script.name
+                Language           = $Script.language
+                Category           = $CategoryName
+                OriginalCategories = $OriginalCategoryNames
+                Description        = $Script.description
+                FileName           = $ScriptFileName
+                FilePath           = Join-Path "$ScriptFolder\$CategoryName" $ScriptFileName
+                Code               = $ScriptCode
+                Failed             = $false
+                MultiCat           = ($ScriptContent.categoriesIds.Count -gt 1)
             }
         } catch {
-            Write-Host "Failed to download: $($Script.name)" -ForegroundColor Red
-            $global:FailedScripts += $Script.name
+            $ScriptArray += [PSCustomObject]@{
+                Name     = $Script.name
+                FileName = $ScriptFileName
+                Failed   = $true
+                MultiCat = $false
+            }
         }
     }
     
-    $CompletedScripts = ($BatchIndex + 1) * $BatchSize
-    $CompletedScripts = [Math]::Min($CompletedScripts, $TotalScripts)
-    $PercentComplete = [math]::Round(($CompletedScripts / $TotalScripts) * 100)
-    Write-Host "Batch $($BatchIndex + 1) complete. Overall progress: $CompletedScripts/$TotalScripts ($PercentComplete%)" -ForegroundColor Green
-}
+    # For sequential mode, we need to write files since code is still in memory
+    Write-Host "Script processing complete! Writing to disk..." -ForegroundColor Green
 
-Write-Progress -Activity "Downloading Scripts" -Completed
-Write-Host "All batches complete! Processing results..." -ForegroundColor Green
+    Write-Host "`nWriting scripts to disk..." -ForegroundColor Cyan
+    $WriteErrors = @()
 
-# Write scripts to files
-Write-Host "`nWriting scripts to disk..." -ForegroundColor Cyan
-foreach ($Script in $global:ScriptArray) {
-    $Failed = $false
-    try {
-        $Script.Code | Set-Content -Path $Script.FilePath -NoNewline
-    } catch {
+    foreach ($Script in $ScriptArray) {
+        $Failed = $false
         try {
-            [System.IO.File]::WriteAllText($Script.FilePath, $Script.Code)
+            # Ensure directory exists
+            $directory = Split-Path -Path $Script.FilePath -Parent
+            if (-not (Test-Path $directory)) {
+                New-Item -Path $directory -ItemType Directory -Force | Out-Null
+            }
+
+            $Script.Code | Set-Content -Path $Script.FilePath -NoNewline -ErrorAction Stop
         } catch {
-            $global:FailedScripts += $Script.FileName
-            $Failed = $true
+            try {
+                [System.IO.File]::WriteAllText($Script.FilePath, $Script.Code)
+            } catch {
+                $WriteErrors += [PSCustomObject]@{
+                    Name = $Script.Name
+                    FilePath = $Script.FilePath
+                    Error = $_.Exception.Message
+                }
+                $Failed = $true
+            }
         }
     }
-    if (-not $Failed) {
-        $global:SavedScripts += [PSCustomObject]@{
-            Name = $Script.Name
-            Language = $Script.Language
-            Category = $Script.Category
-            Description = $Script.Description
-            FilePath = $Script.FilePath
+
+    # Show write errors if any
+    if ($WriteErrors.Count -gt 0) {
+        Write-Host "`nFile write errors (first 5):" -ForegroundColor Red
+        $WriteErrors | Select-Object -First 5 | ForEach-Object {
+            Write-Host "  $($_.Name): $($_.Error)" -ForegroundColor Yellow
         }
     }
 }
+
+# This runs regardless of which path was taken
+$SavedScripts = $ScriptArray | Where-Object { -not $_.Failed } | Select-Object Name, Language, Category, Description, FilePath
+$FailedScripts = $ScriptArray | Where-Object { $_.Failed }
+$MultipleScripts = $ScriptArray | Where-Object { $_.MultiCat -and -not $_.Failed }
 
 # Display results
-if ($global:MultipleScripts) {
-    Write-Warning "The following scripts with multiple categories were saved to '- Duplicates' folder:"
-    $global:MultipleScripts | Format-Table -AutoSize
+if ($MultipleScripts) {
+    Write-Warning "The following scripts with multiple categories were saved to '- Duplicate-Categories' folder:"
+    $MultipleScripts | Select-Object Name, @{N='Categories';E={$_.OriginalCategories}} | 
+        Sort-Object Categories, Name | Format-Table -AutoSize
 }
 
-if ($global:FailedScripts.Count -gt 0) {
+if ($FailedScripts.Count -gt 0) {
     Write-Host "`nFailed scripts:" -ForegroundColor Red
-    $global:FailedScripts | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+    $FailedScripts | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor Yellow }
 }
 
-$global:SavedScripts | Select-Object Name, Language, Category, Description, FilePath | 
+$ScriptArray | Where-Object { -not $_.Failed } | Select-Object Name, Language, Category, Description, FilePath | 
     Sort-Object Category | 
     Export-Csv -Path "$ScriptFolder\Scripts.csv" -NoTypeInformation
 
@@ -442,9 +610,9 @@ Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "Download Complete!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 Write-Host "Total scripts: $TotalScripts" -ForegroundColor Cyan
-Write-Host "Successfully saved: $($global:SavedScripts.Count)" -ForegroundColor Green
-Write-Host "Failed: $($global:FailedScripts.Count)" -ForegroundColor $(if ($global:FailedScripts.Count -gt 0) { 'Red' } else { 'Green' })
-Write-Host "Multiple categories (saved to '- Duplicates'): $($global:MultipleScripts.Count)" -ForegroundColor Yellow
+Write-Host "Successfully saved: $($SavedScripts.Count)" -ForegroundColor Green
+Write-Host "Failed: $($FailedScripts.Count)" -ForegroundColor $(if ($FailedScripts.Count -gt 0) { 'Red' } else { 'Green' })
+Write-Host "Multiple categories (saved to '- Duplicate-Categories'): $($MultipleScripts.Count)" -ForegroundColor Yellow
 Write-Host "`nScripts saved to: $ScriptFolder" -ForegroundColor Cyan
 Write-Host "Script details exported to: $ScriptFolder\Scripts.csv" -ForegroundColor Cyan
 Write-Host "Session cached at: $env:USERPROFILE\.ninja_session.xml" -ForegroundColor Cyan
