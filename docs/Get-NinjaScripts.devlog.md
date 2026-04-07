@@ -122,7 +122,7 @@ This is a known limitation — the path should be parameterized for broader use,
 
 ## Key Invariants & Assumptions
 
-These are the core truths the script is built around. If any of these change, the corresponding logic needs revisiting.
+These are the core architectural principles the script is built around. If any of these change, the corresponding logic needs revisiting.
 
 | Invariant | Detail |
 |---|---|
@@ -131,15 +131,27 @@ These are the core truths the script is built around. If any of these change, th
 | DPAPI encryption is user+machine bound | `ConvertFrom-SecureString` output can only be decrypted by the same user on the same machine |
 | Session expires after unknown duration | NinjaRMM doesn't publish session TTL; 2-hour cache expiry is conservative |
 | Script content is base64-encoded | All script code in API responses is base64; must decode with UTF-8 |
-| EdgeDriver path is configurable | Current path: `C:\Git\tawtek\ninjaone-api-scripts\msedgedriver.exe` |
-| Selenium EdgeOptions API varies by version | Use `AddArguments()` first, fallback to `AddAdditionalCapability()` |
-| Off-screen positioning uses `--window-position=-32000,-32000` | Starts browser hidden to avoid visual flash during setup |
-| Dynamic screen detection via `System.Windows.Forms.Screen` | Automatically detects primary monitor resolution for centering |
 | `$using:` scope only works in `-Parallel` block | Chained `ForEach-Object` runs on main thread - use direct pipeline assignment to `$ScriptArray` |
 | Progress counter updates ONLY in streaming block | Updating in both parallel and streaming blocks causes double-counting |
 | Files written immediately in parallel mode | Optimizes memory - no script code stored in `$ScriptArray`, only metadata |
-| ThrottleLimit of 50 for parallel processing | Balances API rate limits, memory usage, and download speed |
-| Duplicate scripts table sorted by category then name | Multi-level sort: `Sort-Object Categories, Name` for organized display |
+| Progress bar dismissal requires same scope | `Write-Progress -Completed` must be called from same scope that created the progress bar |
+| `-Sequential` parameter forces sequential mode | Allows PowerShell 7+ users to opt for sequential processing when needed |
+| `-ClearCache` parameter works with splatting syntax | `-ForceClear:$ClearCache` properly passes switch parameter to function |
+| Parallel processing requires result output | `$result` must be output to pipeline for collection into `$ScriptArray` |
+| Category folder names preserve original naming | Windows supports spaces in folder names, no character replacement needed |
+
+---
+
+## Implementation Details & Limitations
+
+| Detail | Current Implementation |
+|---|---|
+| EdgeDriver path | Hardcoded to `C:\Git\tawtek\ninjaone-api-scripts\msedgedriver.exe` |
+| Selenium EdgeOptions API | Uses fallback chain: `AddArguments()` then `AddAdditionalCapability()` |
+| Off-screen positioning | Uses `--window-position=-32000,-32000` to start browser hidden |
+| Screen detection | Dynamic detection via `System.Windows.Forms.Screen.PrimaryScreen` |
+| Parallel ThrottleLimit | Set to 50 for balance of speed vs resource usage |
+| Category sorting | Multi-level sort: `Sort-Object Categories, Name` for readability |
 
 ---
 
@@ -162,6 +174,34 @@ Response status code does not indicate success: 401 (Unauthorized)
 **Root cause:** The legacy scripting endpoint predates the OAuth API and was never updated to support bearer tokens. It only accepts session cookies from browser-based login.
 
 **Fix:** Pivoted to Selenium browser automation to capture session cookies.
+
+---
+
+### Progress bar persistence in both processing modes
+
+Progress bar remained visible after script completion in both sequential and parallel modes, requiring Ctrl+C to dismiss.
+
+**Sequential Mode Issue:**
+**Root cause:** `Write-Progress -Completed` only dismisses progress bar when called from the same scope that owns it. In sequential mode, the progress bar was being created inside the foreach loop but the dismissal call was outside the proper scope context.
+
+**Parallel Mode Issue:**
+**Root cause:** Progress updates were happening inside parallel runspaces (child scopes), not the main thread. The main thread never owned the progress bar, so `-Completed` on the main thread didn't dismiss it.
+
+**Fix:** 
+- **Sequential:** Added `Write-Progress -Activity "Downloading Scripts" -Completed` immediately after the foreach loop
+- **Parallel:** Removed all `Write-Progress` calls from inside the parallel block and streamed results back to the main thread for progress updates
+
+**Key Insight:** Progress bar ownership is scope-bound - the thread/scope that creates the progress bar must also be the one to dismiss it.
+
+---
+
+### Parallel processing showing zero script counts
+
+Script output showed "Successfully saved: 0" and "Failed: 0" despite processing 1101 scripts in parallel mode.
+
+**Root cause:** The parallel processing block was missing the `$result` output to the pipeline. Results were being generated inside the parallel block but not passed through to the streaming `ForEach-Object` for collection into `$ScriptArray`.
+
+**Fix:** Added `$result` output at the end of the streaming `ForEach-Object` block to ensure results are collected into `$ScriptArray`.
 
 ---
 
@@ -627,3 +667,9 @@ Added `| Out-Null` to suppress the return value from `AddOrUpdate()` which was c
 | 2026-04-07 | **Category name sanitization** - Replace invalid filesystem characters in folder names while preserving originals in CSV |
 | 2026-04-07 | **Memory optimization** - Files written immediately in parallel mode, no code stored in `$ScriptArray` |
 | 2026-04-07 | **Duplicate scripts sorting** - Added multi-level sort (category A-Z, then name A-Z) for better readability |
+| 2026-04-07 | **Sequential processing parameter** - Added `-Sequential` switch to force PowerShell 5.1-style sequential processing on PowerShell 7+ |
+| 2026-04-07 | **Progress bar dismissal fix** - Fixed persistent progress bar in sequential mode by adding `Write-Progress -Completed` after foreach loop |
+| 2026-04-07 | **Cache clearing parameter fix** - Fixed `-ClearCache` parameter passing to ensure proper session cache clearing |
+| 2026-04-07 | **Parallel result collection fix** - Fixed missing `$result` output in parallel processing pipeline, causing zero script counts |
+| 2026-04-07 | **Category mapping status table** - Added detailed category mapping table showing file paths for mapped categories and excluded status for native categories |
+| 2026-04-07 | **Category folder name preservation** - Removed unnecessary character replacement, preserving original category names with spaces in folder paths |

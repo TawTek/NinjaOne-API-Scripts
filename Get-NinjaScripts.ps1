@@ -19,7 +19,8 @@ Supports: Edge or Chrome browser
 
 param(
     [string]$ScriptFolder = "C:\Temp\NinjaScripts",
-    [switch]$ClearCache
+    [switch]$ClearCache,
+    [switch]$Sequential
 )
 
 function Get-NinjaSession {
@@ -272,17 +273,31 @@ $CategoriesHash = @{}
 if ($CategoriesResponse -and $CategoriesResponse.Count -gt 0) {
     Write-Host "Building categories from API response ($($CategoriesResponse.Count) categories)..." -ForegroundColor Cyan
     $ExcludedCount = 0
+    $CategoryStatus = @()
+    
     foreach ($Category in $CategoriesResponse) {
         if ($Category.id -and $Category.name) {
             # Skip excluded native categories
             if ($ExcludedCategories -contains $Category.name) {
                 $ExcludedCount++
+                $CategoryStatus += [PSCustomObject]@{
+                    Category = $Category.name
+                    Path = 'Excluded'
+                }
                 continue
             }
             $CategoriesHash[[int]$Category.id] = $Category.name
+            $CategoryStatus += [PSCustomObject]@{
+                Category = $Category.name
+                Path = "$ScriptFolder\$($Category.name)"
+            }
         }
     }
+    
     Write-Host "Successfully mapped $($CategoriesHash.Count) categories! (Excluded $ExcludedCount native categories)" -ForegroundColor Green
+    Write-Host "`nCategory Mapping Status:" -ForegroundColor Cyan
+    $CategoryStatus | Sort-Object Path, Category | Format-Table -AutoSize
+    Write-Host ""
 } else {
     Write-Host "Using fallback hardcoded categories..." -ForegroundColor Yellow
     $CategoriesHash = @{
@@ -338,8 +353,8 @@ foreach ($CategoryName in $CategoriesHash.Values) {
 Set-Directory -Path "$ScriptFolder\- Duplicate-Categories" -Create
 
 # Check PowerShell version and use parallel processing if available
-if ($PSVersionTable.PSVersion.Major -ge 7) {
-    Write-Host "PowerShell 7+ detected - using parallel processing (ThrottleLimit: 20)" -ForegroundColor Green
+if ($PSVersionTable.PSVersion.Major -ge 7 -and -not $Sequential) {
+    Write-Host "Using parallel processing (ThrottleLimit: 20) to download scripts." -ForegroundColor Green
     
     # Create thread-safe concurrent dictionaries
     $ProcessedScripts = [System.Collections.Concurrent.ConcurrentDictionary[string,int]]::new()
@@ -468,14 +483,14 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
         Write-Progress -Activity "Downloading Scripts" `
             -Status "$total/$TotalScripts | $percent% Complete" `
             -PercentComplete $percent
-        $result  # pass through — collected into $ScriptArray by the assignment
+        $result  # Output result to be collected into $ScriptArray
     }
     
     Write-Progress -Activity "Downloading Scripts" -Completed
         
 } else {
-    Write-Host "PowerShell 5.1 detected - using sequential processing" -ForegroundColor Yellow
-        
+    Write-Host "Using sequential processing to download scripts." -ForegroundColor Yellow
+    
     $ScriptArray = @()
     $ProcessedScript = @{}
     $CurrentScript = 0
@@ -546,6 +561,9 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
         }
     }
     
+    # Dismiss progress bar immediately after loop
+    Write-Progress -Activity "Downloading Scripts" -Completed
+    
     # For sequential mode, we need to write files since code is still in memory
     Write-Host "Script processing complete! Writing to disk..." -ForegroundColor Green
 
@@ -553,7 +571,6 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     $WriteErrors = @()
 
     foreach ($Script in $ScriptArray) {
-        $Failed = $false
         try {
             # Ensure directory exists
             $directory = Split-Path -Path $Script.FilePath -Parent
@@ -571,7 +588,6 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                     FilePath = $Script.FilePath
                     Error = $_.Exception.Message
                 }
-                $Failed = $true
             }
         }
     }
