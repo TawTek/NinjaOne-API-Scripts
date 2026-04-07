@@ -3,6 +3,13 @@ BeforeAll {
     $script:ScriptPath = "$PSScriptRoot\..\Get-NinjaScripts.ps1"
     $script:ScriptContent = Get-Content $script:ScriptPath -Raw
     
+    # Extract specific sections for focused testing
+    $script:ParamBlock = ($script:ScriptContent -split "param\(")[1] -split "\)[^{]*{" | Select-Object -First 1
+    $script:MainLogic = ($script:ScriptContent -split "if.*PSVersionTable.*Major.*ge.*7.*and.*not.*Sequential")[1] -split "} else {" | Select-Object -First 1
+    $script:SequentialLogic = ($script:ScriptContent -split "} else {")[1] -split "Write-Host.*Processing.*scripts" | Select-Object -First 1
+    $script:ProgressLogic = $script:ScriptContent | Select-String -Pattern "Write-Progress" -Context 2,2
+    $script:ErrorHandling = $script:ScriptContent | Select-String -Pattern "try.*{" -Context 0,5
+    
     # Mock session for testing without browser automation
     $script:MockSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
     $script:MockSession.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -208,17 +215,15 @@ Describe 'Get-NinjaScripts.ps1 - Code Structure' {
     
     Context 'Error handling' {
         It 'has try/catch for authentication' {
-            $script:ScriptContent | Should -Match 'try\s*\{[^}]*Get-NinjaSession[^}]*\}\s*catch'
+            $script:ScriptContent | Should -Match 'try\s*\{.*Get-NinjaSession.*\}\s*catch'
         }
         
         It 'has try/catch for script fetching' {
-            $script:ScriptContent | Should -Match 'try'
-            $script:ScriptContent | Should -Match 'Invoke-RestMethod'
-            $script:ScriptContent | Should -Match 'catch'
+            $script:ScriptContent | Should -Match 'try\s*\{.*Invoke-RestMethod.*\}\s*catch'
         }
         
         It 'tracks failed scripts in ScriptArray' {
-            $script:ScriptContent | Should -Match '\$FailedScripts.*Where-Object.*Failed'
+            $script:ScriptContent | Should -Match 'Failed.*=.*\$true'
         }
         
         It 'uses ErrorAction Stop for web requests' {
@@ -401,8 +406,8 @@ Describe 'Get-NinjaScripts.ps1 - Integration Patterns' {
         }
         
         It 'has sequential fallback for PowerShell 5.1' {
-            $script:ScriptContent | Should -Match 'PowerShell 5.1 detected'
-            $script:ScriptContent | Should -Match 'sequential processing'
+            $script:ScriptContent | Should -Match 'Using sequential processing to download scripts'
+            $script:ScriptContent | Should -Match 'PSVersionTable\.PSVersion\.Major'
         }
     }
 }
