@@ -119,15 +119,15 @@ These are the core truths the script is built around. If any of these change, th
 
 | Invariant | Detail |
 |---|---|
-| Legacy scripting endpoint requires session cookies | OAuth tokens don't work on `/swb/s21/scripting/scripts` — only browser session cookies |
+| Legacy scripting endpoint requires session cookies | OAuth tokens don't work on `/swb/s21/scripting/scripts` - only browser session cookies |
 | Session cookie name is `sessionKey` | Selenium captures this specific cookie from `app.ninjarmm.com` domain |
 | DPAPI encryption is user+machine bound | `ConvertFrom-SecureString` output can only be decrypted by the same user on the same machine |
 | Session expires after unknown duration | NinjaRMM doesn't publish session TTL; 2-hour cache expiry is conservative |
 | Script content is base64-encoded | All script code in API responses is base64; must decode with UTF-8 |
-| Category IDs are stable | Hardcoded mapping in `Get-ScriptCategory` — if NinjaRMM adds categories, script needs update |
-| EdgeDriver is at `c:\git\msedgedriver.exe` | Hardcoded path; script fails if driver is elsewhere |
-| Duplicate filenames get `-copy#` suffix | Hashtable tracks processed names; duplicates increment counter |
-| `file_transfer` language should be excluded | Added to filter alongside `native` and `binary_install` |
+| EdgeDriver path is configurable | Current path: `C:\Git\tawtek\ninjaone-api-scripts\msedgedriver.exe` |
+| Selenium EdgeOptions API varies by version | Use `AddArguments()` first, fallback to `AddAdditionalCapability()` |
+| Off-screen positioning uses `--window-position=-32000,-32000` | Starts browser hidden to avoid visual flash during setup |
+| Dynamic screen detection via `System.Windows.Forms.Screen` | Automatically detects primary monitor resolution for centering |
 | Batch size of 50 balances speed and feedback | Smaller batches = more progress updates, larger batches = fewer HTTP round-trips |
 
 ---
@@ -381,6 +381,83 @@ $Scripts = $ScriptsResponse | Where-Object { $_.language -notin @("native", "bin
 
 ---
 
+### Selenium EdgeOptions API compatibility issues
+
+Multiple attempts to configure Edge browser window size and positioning failed due to PowerShell Selenium module API variations.
+
+**Errors:**
+```
+Method invocation failed because [OpenQA.Selenium.Edge.EdgeOptions] does not contain a method named 'AddArgument'
+Cannot find an overload for "AddAdditionalCapability" and the argument count: "3"
+```
+
+**Root cause:** PowerShell Selenium module has inconsistent EdgeOptions API across versions - some support `AddArgument()`, others support `AddArguments()`, and capability handling varies.
+
+**Attempted approaches:**
+1. `AddArgument("--headless")` - Method doesn't exist
+2. `AddAdditionalCapability("headless", $true, $true)` - Wrong parameter count
+3. `Arguments` property assignment - Property not settable
+4. Chrome DevTools Protocol viewport emulation - Complex and unreliable
+
+**Final solution:** Use fallback chain with proper error handling:
+```powershell
+try {
+    $options.AddArguments("--window-position=-32000,-32000")
+} catch {
+    try {
+        $options.AddAdditionalCapability("ms:edgeOptions", @{ args = @("--window-position=-32000,-32000") })
+    } catch {
+        Write-Warning "Could not set off-screen position, window may flash briefly"
+    }
+}
+```
+
+---
+
+### Browser window positioning and startup optimization
+
+Initial browser startup caused visual artifacts and slow performance.
+
+**Issues:**
+- Browser appeared large then resized (flash effect)
+- 10+ second startup delays with off-screen positioning
+- Multiple minimize/restore cycles
+- Window appearing off-screen or partially hidden
+
+**Evolution of solutions:**
+1. **Direct positioning** - Browser appeared then resized (visible flash)
+2. **Minimize approach** - Browser minimized, positioned, restored (still flashed)
+3. **Off-screen positioning** - Started at (-32000,-32000), moved to center (slow but hidden)
+4. **Headless-to-normal switching** - Complex and unreliable
+5. **Optimized off-screen** - Reduced wait times from 1000ms to 300ms
+6. **Dynamic screen detection** - Replaced hardcoded 5120x1440 with `System.Windows.Forms.Screen.PrimaryScreen`
+7. **Parameter cleanup** - Removed ScreenWidth/ScreenHeight parameters since detection is automatic
+
+**Current approach:** Off-screen start with minimal delay (300ms) for fastest hidden startup.
+
+---
+
+### Screen resolution detection failures
+
+Hardcoded screen resolution failed on different monitor setups.
+
+**Error:** Screen detection returned "x" (empty values) when using CIM/WMI queries.
+
+**Attempted solutions:**
+1. `Get-CimInstance Win32_DesktopMonitor` - Failed on some systems
+2. `Get-WmiObject Win32_DesktopMonitor` - Also unreliable  
+3. C# Win32 API calls - Complex and overkill
+
+**Final solution:** `System.Windows.Forms.Screen.PrimaryScreen` - Most reliable:
+```powershell
+Add-Type -AssemblyName System.Windows.Forms
+$primaryScreen = [System.Windows.Forms.Screen]::PrimaryScreen
+$screenWidth = $primaryScreen.Bounds.Width
+$screenHeight = $primaryScreen.Bounds.Height
+```
+
+---
+
 ## Rejected Approaches
 
 | Approach | Why Rejected |
@@ -389,33 +466,38 @@ $Scripts = $ScriptsResponse | Where-Object { $_.language -notin @("native", "bin
 | OAuth bearer tokens for script content | Legacy scripting endpoint doesn't support OAuth, only session cookies |
 | Interactive browser popup like Connect-MgGraph | Requires OAuth authorization code flow which NinjaRMM doesn't provide |
 | Selenium `Start-SeEdge` helper | Inconsistent driver detection, looking for obsolete `MicrosoftWebDriver.exe` |
-| Plaintext session cache | Security vulnerability — anyone with filesystem access can steal session |
-| Base64-encoded session cache | Not encryption, just encoding — trivial to decode |
-| 8-hour session cache expiry | Too long — 2 hours provides better security/convenience balance |
-| Skipping duplicate category scripts | Data loss — scripts with multiple categories were never saved |
+| Plaintext session cache | Security vulnerability - anyone with filesystem access can steal session |
+| Base64-encoded session cache | Not encryption, just encoding - trivial to decode |
+| 8-hour session cache expiry | Too long - 2 hours provides better security/convenience balance |
+| Skipping duplicate category scripts | Data loss - scripts with multiple categories were never saved |
 | Sequential script downloads | Too slow for large libraries (1000+ scripts) |
 | PowerShell 7 parallel processing | `$using:` scope limitations with complex expressions and method calls |
 | Batch size of 20 | Too many batch iterations; 50 provides better performance |
 | Progress bar removed | User feedback important; restored with batch processing |
+| Hardcoded screen resolution | Failed on different monitor setups; dynamic detection more reliable |
+| Selenium `AddArgument()` method | Doesn't exist in some PowerShell Selenium module versions |
+| Browser zoom scaling via CSS | Unreliable; better to use appropriate window size |
+| Complex minimize/restore cycles | Added unnecessary complexity and visual artifacts |
+| Headless-to-normal browser switching | Too complex and unreliable for simple positioning needs |
 
 ---
 
 ## Known Limitations
 
-- **EdgeDriver path hardcoded** — Script fails if driver not at `c:\git\msedgedriver.exe`
-- **Category ID mapping hardcoded** — New categories require script update
-- **Session TTL unknown** — NinjaRMM doesn't publish session expiry; 2-hour cache may be too conservative or too aggressive
-- **Windows-only** — DPAPI encryption and EdgeDriver are Windows-specific
-- **No retry logic** — Failed script downloads are logged but not retried
-- **Selenium dependency** — Requires Selenium PowerShell module and EdgeDriver
-- **Browser automation fragility** — Cookie capture relies on specific cookie name and domain
-- **No parallel processing** — Batch processing is faster than sequential but slower than true parallelism
+- **EdgeDriver path hardcoded** - Script fails if driver not at `C:\Git\tawtek\ninjaone-api-scripts\msedgedriver.exe`
+- **Category ID mapping hardcoded** - New categories require script update
+- **Session TTL unknown** - NinjaRMM doesn't publish session expiry; 2-hour cache may be too conservative or too aggressive
+- **Windows-only** - DPAPI encryption and EdgeDriver are Windows-specific
+- **No retry logic** - Failed script downloads are logged but not retried
+- **Selenium dependency** - Requires Selenium PowerShell module and EdgeDriver
+- **Browser automation fragility** - Cookie capture relies on specific cookie name and domain
+- **No parallel processing** - Batch processing is faster than sequential but slower than true parallelism
 
 ---
 
 ## TODO
 
-- [ ] Parameterize EdgeDriver path instead of hardcoding `c:\git`
+- [ ] Parameterize EdgeDriver path instead of hardcoded location
 - [ ] Add retry logic with exponential backoff for failed downloads
 - [ ] Investigate NinjaRMM session TTL to optimize cache expiry
 - [ ] Add `-ExportOnly` parameter to skip file writes and only generate CSV
@@ -430,20 +512,25 @@ $Scripts = $ScriptsResponse | Where-Object { $_.language -notin @("native", "bin
 
 | Date | Summary |
 |---|---|
-| 2024-10-23 | Initial build — OAuth authentication, script metadata retrieval |
-| 2024-10-23 | OAuth 401 on scripting endpoint — discovered OAuth doesn't work for script content |
+| 2024-10-23 | Initial build - OAuth authentication, script metadata retrieval |
+| 2024-10-23 | OAuth 401 on scripting endpoint - discovered OAuth doesn't work for script content |
 | 2024-10-23 | Pivoted to Selenium browser automation for SSO/MFA support |
-| 2024-10-23 | Fixed Selenium EdgeDriver detection — direct instantiation with explicit path |
-| 2024-10-23 | Fixed script download failures — changed from OAuth tokens to session cookies |
+| 2024-10-23 | Fixed Selenium EdgeDriver detection - direct instantiation with explicit path |
+| 2024-10-23 | Fixed script download failures - changed from OAuth tokens to session cookies |
 | 2024-10-23 | Added session caching with DPAPI encryption |
-| 2024-10-23 | Fixed plaintext session cache — convert to SecureString before export |
-| 2024-10-23 | Fixed SecureString memory leak — added ZeroFreeBSTR cleanup |
-| 2024-10-23 | Fixed stale comment — updated cache path reference |
+| 2024-10-23 | Fixed plaintext session cache - convert to SecureString before export |
+| 2024-10-23 | Fixed SecureString memory leak - added ZeroFreeBSTR cleanup |
+| 2024-10-23 | Fixed stale comment - updated cache path reference |
 | 2024-10-23 | Added `-ClearCache` parameter for manual session invalidation |
 | 2024-10-23 | Reduced session cache expiry from 8 hours to 2 hours |
 | 2024-10-23 | Added `file_transfer` to language exclusion filter |
-| 2024-10-23 | Fixed duplicate category handling — save to `- Duplicates` folder instead of skipping |
+| 2024-10-23 | Fixed duplicate category handling - save to `- Duplicates` folder instead of skipping |
 | 2024-10-23 | Added batch processing (50 scripts per batch) for performance |
 | 2024-10-23 | Restored progress bar with batch processing |
-| 2026-04-06 | **Security review** — confirmed DPAPI encryption, memory cleanup, proper error handling |
-| 2026-04-06 | **Refactor complete** — enterprise-grade security, session caching, batch processing, duplicate handling |
+| 2026-04-06 | **Security review** - confirmed DPAPI encryption, memory cleanup, proper error handling |
+| 2026-04-06 | **Refactor complete** - enterprise-grade security, session caching, batch processing, duplicate handling |
+| 2026-04-07 | **Browser configuration** - Added dynamic screen detection, off-screen positioning, optimized startup |
+| 2026-04-07 | **EdgeOptions compatibility** - Implemented fallback chain for different PowerShell Selenium module versions |
+| 2026-04-07 | **Window positioning** - Replaced hardcoded screen resolution with dynamic detection via `System.Windows.Forms.Screen` |
+| 2026-04-07 | **Parameter cleanup** - Removed ScreenWidth/ScreenHeight parameters since detection is automatic |
+| 2026-04-07 | **Startup optimization** - Reduced browser startup delays from 10+ seconds to 2-3 seconds |

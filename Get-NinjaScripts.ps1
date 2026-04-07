@@ -31,6 +31,11 @@ function Get-NinjaSession {
     Opens browser for SSO/MFA login, captures session cookies automatically.
     Supports all authentication methods including SSO and MFA.
     Caches session for reuse to avoid repeated authentication.
+    
+    .PARAMETER ForceClear
+    Force clear the cached session
+    
+    .PARAMETER ScreenWidth
     #>
     
     param(
@@ -110,19 +115,59 @@ function Get-NinjaSession {
     try {
         Write-Host "Starting Microsoft Edge..." -ForegroundColor Cyan
         
+        # Get primary monitor resolution dynamically
+        Add-Type -AssemblyName System.Windows.Forms
+        $primaryScreen = [System.Windows.Forms.Screen]::PrimaryScreen
+        $screenWidth = $primaryScreen.Bounds.Width
+        $screenHeight = $primaryScreen.Bounds.Height
+        Write-Host "Detected primary monitor: ${screenWidth}x${screenHeight}" -ForegroundColor DarkGray
+        
         # Create Edge driver service with explicit path
-        $driverPath = "c:\git"
+        $driverPath = "C:\Git\tawtek\ninjaone-api-scripts"
         $service = [OpenQA.Selenium.Edge.EdgeDriverService]::CreateDefaultService($driverPath, "msedgedriver.exe")
         $service.HideCommandPromptWindow = $true
         
-        # Create Edge options
+        # Create Edge options to start window off-screen
         $options = New-Object OpenQA.Selenium.Edge.EdgeOptions
         
-        # Create driver
-        $Driver = New-Object OpenQA.Selenium.Edge.EdgeDriver($service, $options)
-        Write-Host "Edge browser started successfully.`n" -ForegroundColor Green
+        # Try different methods to set window position off-screen
+        try {
+            # Try AddArguments (plural) first
+            $options.AddArguments("--window-position=-32000,-32000")
+        } catch {
+            try {
+                # Fallback to AddAdditionalCapability with raw EdgeDriver format
+                $options.AddAdditionalCapability("ms:edgeOptions", @{ args = @("--window-position=-32000,-32000") })
+            } catch {
+                Write-Warning "Could not set off-screen position, window may flash briefly"
+            }
+        }
         
+        # Create driver with off-screen window
+        $Driver = New-Object OpenQA.Selenium.Edge.EdgeDriver($service, $options)
+        
+        # Calculate window size and center position
+        $windowWidth = 1100
+        $windowHeight = 700
+        $centerX = [Math]::Max(50, ($screenWidth - $windowWidth) / 2)
+        $centerY = [Math]::Max(50, ($screenHeight - $windowHeight) / 2)
+        
+        Write-Host "Positioning window at (${centerX}, ${centerY})" -ForegroundColor DarkGray
+        
+        $windowSize = New-Object System.Drawing.Size($windowWidth, $windowHeight)
+        $windowPosition = New-Object System.Drawing.Point([int]$centerX, [int]$centerY)
+        
+        # Navigate to URL while off-screen
         $Driver.Navigate().GoToUrl("https://app.ninjarmm.com/")
+        
+        # Wait less time for page to start loading
+        Start-Sleep -Milliseconds 300
+        
+        # Move window to center and set size - window appears here
+        $Driver.Manage().Window.Size = $windowSize
+        $Driver.Manage().Window.Position = $windowPosition
+        
+        Write-Host "Edge browser started successfully (centered on screen).`n" -ForegroundColor Green
         
         $StartTime = Get-Date
         $TimeoutSeconds = 300
