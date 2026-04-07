@@ -1,174 +1,223 @@
 <#
 .SYNOPSIS
-Downloads all scripts from Ninja's Automation library to local folder
+Downloads all scripts from Ninja's Automation library with SSO/MFA support
 
 .DESCRIPTION
-Scripts are filtered to exclude built-in or native scripts and are then downloaded to a specified directory.
-Initializes arrays to store script attributes and failed scripts, and a hashtable to track processed names.
-Iterates through each script, setting the appropriate file extension based on the script's language.
-Invalid characters in the script names are replaced, and duplicate names are handled by appending a "-copy#" suffix.
-Script content, which is Base64-encoded, is decoded into a UTF-8 string and written to a file.
-Progress is tracked and displayed, and any scripts that fail to save are saved to $global:FailedScripts array.
-Details of the downloaded scripts are exported to a CSV file for reference that includes description (if any).
+Uses Selenium browser automation to handle SSO/MFA authentication.
+Opens browser for login, captures session cookies automatically, then downloads all scripts.
+Supports all authentication methods including SSO and multi-factor authentication.
 
 .PARAMETER ScriptFolder
-The directory where the scripts will be downloaded.
+The directory where scripts will be downloaded
 
 .NOTES
 Author: Tawhid Chowdhury
-Date:   2024-10-23
+Date: 2025-10-14
+Requires: Selenium PowerShell module (auto-installed if missing)
+Supports: Edge or Chrome browser
 #>
 
-<#--------------------------------------------------------------------------------------------------------------------------
-SCRIPT:WEBSESSION
---------------------------------------------------------------------------------------------------------------------------#>
+param(
+    [string]$ScriptFolder,
+    [switch]$ClearCache
+)
 
-# Paste web session code here from dev console
-
-<#--------------------------------------------------------------------------------------------------------------------------
-SCRIPT:PARAM_VAR
---------------------------------------------------------------------------------------------------------------------------#>
-
-$Scripts       = $ScriptsResponse.content | ConvertFrom-Json | Where-Object { $_.language -notin @("native", "binary_install") }
-$ScriptBaseURL = $ScriptsResponse.BaseResponse.RequestMessage.RequestUri.AbsoluteUri # URL of scripts library instance
-$ScriptFolder  = "C:\Temp\NinjaScripts\Test" # sets directory to download scripts
-$TotalScripts  = $Scripts.Count # total number of scripts in automation library
-
-$global:FailedScripts   = @() # array to store names of failed scripts
-$global:MultipleScripts = @() # array to store scripts with multiple categories
-$global:ProcessedScript = @{} # hashtable to track processed names
-$global:ScriptArray     = @() # array to store all script properties
-$global:SavedScripts    = @() # Initialize this as an empty array
-
-<#--------------------------------------------------------------------------------------------------------------------------
-SCRIPT:FUNCTIONS
---------------------------------------------------------------------------------------------------------------------------#>
-
-function Get-Scripts {
-
+function Get-NinjaSession {
+    <#
+    .SYNOPSIS
+    Authenticates to NinjaRMM using browser-based SSO/MFA and returns web session.
+    
+    .DESCRIPTION
+    Opens browser for SSO/MFA login, captures session cookies automatically.
+    Supports all authentication methods including SSO and MFA.
+    Caches session for reuse to avoid repeated authentication.
+    #>
+    
     param(
-    [switch]$Debug
+        [switch]$ForceClear
     )
-    $CurrentScript = 0
-
-    foreach ($Script in $Scripts) { # loop through each script in library
-
-        switch ($Script.language) { # set file extension based on language
-            'powershell' { $FileExtension = '.ps1' }
-            'batchfile'  { $FileExtension = '.bat' }
-            'vbscript'   { $FileExtension = '.vbs' }
-            'sh'         { $FileExtension = '.sh' }
-            default      { throw "Error: Unknown language type $($Script.language)" }
-        }
-
-        # Replaces invalid characters, trims whitespace, combines script name + extension
-        $BaseFileName   = (($Script.name -replace '[\\/:*?"<>&|]', '_').TrimStart())
-        $ScriptFileName = $BaseFileName + $FileExtension
-
-        # Check for scripts in library with same filename
-        if ($global:ProcessedScript.ContainsKey($BaseFileName)) { # first iteration -eq $false and else block executes
-            $global:ProcessedScript[$BaseFileName]++ # count incremented if $true
-            $ScriptFileName = "$BaseFileName-copy$($global:ProcessedScript[$BaseFileName])$FileExtension" # append '-copy#'
-        } else {
-            $global:ProcessedScript[$BaseFileName] = 0 # first iteration initalizes count for subsequent loops
-        }
-
-        # Update script count + progress bar that outputs the $ScriptFileName being processed
-        $CurrentScript++
-        $PercentComplete = [math]::Round(($CurrentScript / $TotalScripts) * 100)
-        Write-Progress -Activity "Downloading Scripts" `
-            -Status "$CurrentScript/$TotalScripts | $PercentComplete% Complete | $ScriptFileName" `
-            -PercentComplete $PercentComplete       
-
-        # Store script content in variable for easier property sourcing
-        $ScriptContent = (Invoke-WebRequest -UseBasicParsing -Uri "$ScriptBaseURL/$($Script.id)" `
-                        -WebSession $session -ContentType "application/json").Content | ConvertFrom-Json
-
-        # Get category name(s)
-        $CategoryName = ((Get-ScriptCategory -CategoryIDs $ScriptContent.categoriesIds) -replace '[\\/:*?"<>|]', '_')
-        Set-Directory -Path "$ScriptFolder\$CategoryName" -Create # create category folder
-
-        # Checks and skips iteration if multiple categories exist for script
-        if ($ScriptContent.categoriesIds.Count -gt 1) {
-            $global:MultipleScripts    += [PSCustomObject]@{ # store scripts name and category in custom array
-                ScriptName    = $Script.name
-                CategoryNames = $CategoryName
-            }
-            continue
-        }
-
-        # Decode the Base64-encoded string into a UTF-8 string so that script is readable
-        $ScriptCode = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($ScriptContent.code))
-
-        # Create a PSCustomObject to store script details
-        $global:ScriptArray += [PSCustomObject]@{
-            Name        = $Script.name
-            Language    = $Script.language
-            Category    = $CategoryName
-            Description = $Script.description
-            FileName    = $ScriptFileName
-            FilePath    = Join-Path "$ScriptFolder\$CategoryName" $ScriptFileName
-            Code        = $ScriptCode
-        } 
-        if ($Debug) { if (++$counter -ge 3) { break } }
+    
+    $SessionCachePath = "$env:USERPROFILE\.ninja_session.xml"
+    $CacheExpiryHours = 2  # Session valid for 2 hours
+    
+    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "NinjaRMM Browser Authentication" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+    
+    # Clear cache if requested
+    if ($ForceClear -and (Test-Path $SessionCachePath)) {
+        Remove-Item $SessionCachePath -Force
+        Write-Host "Session cache cleared." -ForegroundColor Yellow
     }
-    Write-Progress -Activity "Downloading Scripts" -Completed
-}
-
-function Write-Script {
-    foreach ($Script in $global:ScriptArray) { # loop through each script in the array            
+    
+    # Check cached session
+    if (Test-Path $SessionCachePath) {
         try {
-            # Write the script code to the specified file path
-            $Script.Code | Set-Content -Path $Script.FilePath -NoNewline
+            $CachedSession = Import-Clixml -Path $SessionCachePath
+            
+            if ($CachedSession.ExpiresAt -gt (Get-Date)) {
+                $HoursRemaining = [math]::Round(($CachedSession.ExpiresAt - (Get-Date)).TotalHours, 1)
+                Write-Host "Using cached session (expires in $HoursRemaining hours)..." -ForegroundColor Green
+                
+                # Recreate WebSession from cached data
+                $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+                $session.UserAgent = $CachedSession.UserAgent
+                
+                # Decrypt session key from DPAPI-encrypted SecureString
+                $SecureKey = $CachedSession.SessionKey | ConvertTo-SecureString
+                $BStr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureKey)
+                try {
+                    $DecryptedSessionKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto($BStr)
+                } finally {
+                    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BStr)
+                }
+                
+                $session.Cookies.Add((New-Object System.Net.Cookie("sessionKey", $DecryptedSessionKey, "/", "app.ninjarmm.com")))
+                
+                # Test if session is still valid
+                try {
+                    Invoke-WebRequest -Uri "https://app.ninjarmm.com/swb/s21/scripting/scripts" `
+                        -Method Get `
+                        -WebSession $session `
+                        -Headers @{ "Accept" = "application/json" } `
+                        -ErrorAction Stop | Out-Null
+                    
+                    Write-Host "Cached session is valid!`n" -ForegroundColor Green
+                    return $session
+                } catch {
+                    Write-Host "Cached session expired, re-authenticating..." -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "Cached session expired, re-authenticating..." -ForegroundColor Yellow
+            }
         } catch {
+            Write-Host "Could not load cached session, re-authenticating..." -ForegroundColor Yellow
+        }
+    }
+    
+    # Import Selenium module
+    if (-not (Get-Module -ListAvailable -Name Selenium)) {
+        throw "Selenium module not found. Please run: Install-Module -Name Selenium"
+    }
+    Import-Module Selenium -ErrorAction Stop
+    
+    Write-Host "`nOpening browser for SSO/MFA login..." -ForegroundColor Yellow
+    Write-Host "Please complete authentication in the browser window." -ForegroundColor Cyan
+    Write-Host "The browser will close automatically after login.`n" -ForegroundColor Cyan
+    
+    $Driver = $null
+    
+    try {
+        Write-Host "Starting Microsoft Edge..." -ForegroundColor Cyan
+        
+        # Create Edge driver service with explicit path
+        $driverPath = "c:\git"
+        $service = [OpenQA.Selenium.Edge.EdgeDriverService]::CreateDefaultService($driverPath, "msedgedriver.exe")
+        $service.HideCommandPromptWindow = $true
+        
+        # Create Edge options
+        $options = New-Object OpenQA.Selenium.Edge.EdgeOptions
+        
+        # Create driver
+        $Driver = New-Object OpenQA.Selenium.Edge.EdgeDriver($service, $options)
+        Write-Host "Edge browser started successfully.`n" -ForegroundColor Green
+        
+        $Driver.Navigate().GoToUrl("https://app.ninjarmm.com/")
+        
+        $StartTime = Get-Date
+        $TimeoutSeconds = 300
+        
+        Write-Host "Waiting for authentication..." -ForegroundColor Cyan
+        
+        while (((Get-Date) - $StartTime).TotalSeconds -lt $TimeoutSeconds) {
+            Start-Sleep -Seconds 2
+            
             try {
-                # Fallback method using .NET to write the file
-                [System.IO.File]::WriteAllText($Script.FilePath, $Script.Code)
+                $Cookies = $Driver.Manage().Cookies.AllCookies
+                $SessionCookie = $Cookies | Where-Object { $_.Name -eq 'sessionKey' }
+                
+                if ($SessionCookie -and $SessionCookie.Value) {
+                    Write-Host "Authentication successful! Session captured.`n" -ForegroundColor Green
+                    
+                    # Create WebSession and add the cookie
+                    $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+                    $session.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+                    $session.Cookies.Add((New-Object System.Net.Cookie("sessionKey", $SessionCookie.Value, "/", "app.ninjarmm.com")))
+                    
+                    # Cache the session with DPAPI encryption
+                    $SessionData = @{
+                        SessionKey = $SessionCookie.Value | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString
+                        UserAgent = $session.UserAgent
+                        ExpiresAt = (Get-Date).AddHours($CacheExpiryHours)
+                    }
+                    $SessionData | Export-Clixml -Path $SessionCachePath
+                    Write-Host "Session cached at: $SessionCachePath" -ForegroundColor DarkGray
+                    Write-Host "Cache expires: $($SessionData.ExpiresAt)" -ForegroundColor DarkGray
+                    
+                    Start-Sleep -Seconds 1
+                    return $session
+                }
             } catch {
-                # If both methods fail, log the script name
-                $global:FailedScripts += $Script.FileName # add failed script to array
-                $Failed = $true
+                # Continue waiting
             }
         }
-        if (!$Failed) {
-            # If the script was saved successfully, log its details
-            $global:SavedScripts += [PSCustomObject]@{
-                Name        = $Script.name
-                Language    = $Script.language
-                Category    = $Script.category
-                Description = $Script.description
-                FilePath    = $Script.FilePath
-            }
+        
+        throw "Timeout: Authentication not completed within $TimeoutSeconds seconds."
+        
+    } finally {
+        if ($Driver) {
+            $Driver.Quit()
         }
     }
-    Write-Progress -Activity "Writing to file" -Completed
 }
 
-function Get-Results {
-    # Warns about scripts with multiple categories not being saved
-    if ($global:MultipleScripts) {
-        Write-Warning "The following scripts with multiple categories were not saved."
-        Write-Warning "Go to Ninja Automation Library amd set scripts to one category only."
-        $global:MultipleScripts | Format-Table -AutoSize
-    }
-    if ($global:FailedScripts.Count -gt 0) {
-        Write-Output "The following scripts failed to save:"
-        $global:FailedScripts | ForEach-Object { Write-Output $_ }
-    }
-    # Export list of scripts saved to CSV file
-    $global:SavedScripts | Select-Object Name,Language,Category,Description,FilePath | Sort-Object Category | Export-Csv -Path "$ScriptFolder\Scripts.csv" -NoTypeInformation
-    Write-Host "Exported saved script details to $ScriptFolder\Scripts.csv." -ForegroundColor Cyan    
+try {
+    # Alternative syntax options:
+    # $session = Get-NinjaSession -ForceClear:$ClearCache           # Colon splatting (concise)
+    # if ($ClearCache) { $session = Get-NinjaSession -ForceClear }   # Conditional (verbose)
+    # $session = Get-NinjaSession @(@{ForceClear=$ClearCache})      # Hashtable splatting
+    
+    $session = Get-NinjaSession -ForceClear:$ClearCache
+} catch {
+    Write-Host "`nERROR: Authentication failed - $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
 }
 
-<#--------------------------------------------------------------------------------------------------------------------------
-SCRIPT:ANCILLARY_FUNCTIONS
---------------------------------------------------------------------------------------------------------------------------#>
+Write-Host "Fetching scripts from NinjaRMM..." -ForegroundColor Cyan
 
+try {
+    $ScriptsResponse = Invoke-RestMethod -Uri "https://app.ninjarmm.com/swb/s21/scripting/scripts" `
+        -Method Get `
+        -WebSession $session `
+        -Headers @{
+            "Accept" = "application/json"
+        } `
+        -ErrorAction Stop
+    
+    Write-Host "Successfully retrieved scripts!`n" -ForegroundColor Green
+    
+} catch {
+    Write-Host "`nERROR: Failed to fetch scripts - $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
+# Initialize variables
+$Scripts = $ScriptsResponse | Where-Object { $_.language -notin @("native", "binary_install", "file_transfer") }
+$ScriptBaseURL = "https://app.ninjarmm.com/swb/s21/scripting/scripts"
+$TotalScripts = $Scripts.Count
+
+$global:FailedScripts = @()
+$global:MultipleScripts = @()
+$global:ProcessedScript = @{}
+$global:ScriptArray = @()
+$global:SavedScripts = @()
+
+Write-Host "Processing $TotalScripts scripts..." -ForegroundColor Cyan
+
+# Helper Functions
 function Get-ScriptCategory {
-    param (
-        [int[]]$CategoryIDs
-    )
-
+    param([int[]]$CategoryIDs)
+    
     $CategoriesHash = @{
         1   = 'Uncategorized'
         8   = '$ WS'
@@ -177,7 +226,7 @@ function Get-ScriptCategory {
         167 = '! Client'
         169 = '$ KF'
     }
-
+    
     $CategoryNames = @()
     foreach ($CategoryID in $CategoryIDs) {
         if ($CategoriesHash.ContainsKey($CategoryID)) {
@@ -189,43 +238,168 @@ function Get-ScriptCategory {
 
 function Set-Directory {
     [CmdletBinding()]
-    param (
+    param(
         [string]$Path,
-        [switch]$Create,
-        [switch]$Remove
+        [switch]$Create
     )
-
-    switch ($true) {
-        { $Create.IsPresent } {
-            if (-not (Test-Path -Path $Path)) {
-                try {
-                    Write-Verbose "Creating directory at $Path"
-                    New-Item -Path $Path -ItemType "Directory" | Out-Null
-                    Write-Verbose "Created diretory at $Path."
-                } catch {
-                    Write-Host "ERROR: Failed to create directory. $($_.Exception.Message)" -ForegroundColor Red
-                }
-            } else {
-                Write-Verbose "Directory exists at $Path"
-            }
-        }
-        { $Remove.IsPresent } {
+    
+    if ($Create.IsPresent) {
+        if (-not (Test-Path -Path $Path)) {
             try {
-                Write-Verbose "Deleting directory."
-                Remove-Item -Path $Path -Recurse -Force @EA_Stop
-                Write-Verbose "Directory deleted."
+                New-Item -Path $Path -ItemType "Directory" | Out-Null
             } catch {
-                Write-Host "ERROR: Failed to remove directory. $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "ERROR: Failed to create directory. $($_.Exception.Message)" -ForegroundColor Red
             }
         }
     }
 }
 
-<#--------------------------------------------------------------------------------------------------------------------------
-SCRIPT:EXECUTIONS
---------------------------------------------------------------------------------------------------------------------------#>
+# Download scripts in batches for better performance
+Write-Host "Downloading $TotalScripts scripts in batches of 50 (this will be much faster!)..." -ForegroundColor Cyan
 
-Set-Directory -Path $ScriptFolder -Create
-Get-Scripts
-Write-Script
-Get-Results
+# Reset global variables
+$global:ScriptArray = @()
+$global:FailedScripts = @()
+$global:MultipleScripts = @()
+$global:ProcessedScript = @{}
+$global:SavedScripts = @()
+
+# Process scripts in batches of 50 for better performance
+$BatchSize = 50
+$Batches = [Math]::Ceiling($TotalScripts / $BatchSize)
+$CurrentScript = 0
+
+for ($BatchIndex = 0; $BatchIndex -lt $Batches; $BatchIndex++) {
+    $StartIndex = $BatchIndex * $BatchSize
+    $EndIndex = [Math]::Min(($BatchIndex + 1) * $BatchSize - 1, $TotalScripts - 1)
+    $BatchScripts = $Scripts[$StartIndex..$EndIndex]
+    
+    Write-Host "Processing batch $($BatchIndex + 1)/$Batches ($($BatchScripts.Count) scripts)..." -ForegroundColor Cyan
+    
+    # Process current batch
+    foreach ($Script in $BatchScripts) {
+        switch ($Script.language) {
+            'powershell' { $FileExtension = '.ps1' }
+            'batchfile'  { $FileExtension = '.bat' }
+            'vbscript'   { $FileExtension = '.vbs' }
+            'sh'         { $FileExtension = '.sh' }
+            default      { Write-Host "Unknown language: $($Script.language)" -ForegroundColor Yellow; continue }
+        }
+        
+        $BaseFileName = (($Script.name -replace '[\\/:*?"<>&|]', '_').TrimStart())
+        $ScriptFileName = $BaseFileName + $FileExtension
+        
+        if ($global:ProcessedScript.ContainsKey($BaseFileName)) {
+            $global:ProcessedScript[$BaseFileName]++
+            $ScriptFileName = "$BaseFileName-copy$($global:ProcessedScript[$BaseFileName])$FileExtension"
+        } else {
+            $global:ProcessedScript[$BaseFileName] = 0
+        }
+        
+        $CurrentScript++
+        $PercentComplete = [math]::Round(($CurrentScript / $TotalScripts) * 100)
+        Write-Progress -Activity "Downloading Scripts" `
+            -Status "$CurrentScript/$TotalScripts | $PercentComplete% Complete | $ScriptFileName" `
+            -PercentComplete $PercentComplete
+        
+        try {
+            $ScriptContent = Invoke-RestMethod -Uri "$ScriptBaseURL/$($Script.id)" `
+                -Method Get `
+                -WebSession $session `
+                -Headers @{
+                    "Accept" = "application/json"
+                } `
+                -ErrorAction Stop
+            
+            # Get original category names for warning message
+            $OriginalCategoryNames = ((Get-ScriptCategory -CategoryIDs $ScriptContent.categoriesIds) -replace '[\\/:*?"<>|]', '_')
+            
+            # Handle scripts with multiple categories by using '- Duplicates' folder
+            if ($ScriptContent.categoriesIds.Count -gt 1) {
+                $CategoryName = "- Duplicates"
+                $global:MultipleScripts += [PSCustomObject]@{
+                    ScriptName    = $Script.name
+                    CategoryNames = $OriginalCategoryNames
+                }
+            } else {
+                $CategoryName = $OriginalCategoryNames
+            }
+            
+            Set-Directory -Path "$ScriptFolder\$CategoryName" -Create
+            
+            $ScriptCode = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($ScriptContent.code))
+            
+            $global:ScriptArray += [PSCustomObject]@{
+                Name = $Script.name
+                Language = $Script.language
+                Category = $CategoryName
+                Description = $Script.description
+                FileName = $ScriptFileName
+                FilePath = Join-Path "$ScriptFolder\$CategoryName" $ScriptFileName
+                Code = $ScriptCode
+            }
+        } catch {
+            Write-Host "Failed to download: $($Script.name)" -ForegroundColor Red
+            $global:FailedScripts += $Script.name
+        }
+    }
+    
+    $CompletedScripts = ($BatchIndex + 1) * $BatchSize
+    $CompletedScripts = [Math]::Min($CompletedScripts, $TotalScripts)
+    $PercentComplete = [math]::Round(($CompletedScripts / $TotalScripts) * 100)
+    Write-Host "Batch $($BatchIndex + 1) complete. Overall progress: $CompletedScripts/$TotalScripts ($PercentComplete%)" -ForegroundColor Green
+}
+
+Write-Progress -Activity "Downloading Scripts" -Completed
+Write-Host "All batches complete! Processing results..." -ForegroundColor Green
+
+# Write scripts to files
+Write-Host "`nWriting scripts to disk..." -ForegroundColor Cyan
+foreach ($Script in $global:ScriptArray) {
+    $Failed = $false
+    try {
+        $Script.Code | Set-Content -Path $Script.FilePath -NoNewline
+    } catch {
+        try {
+            [System.IO.File]::WriteAllText($Script.FilePath, $Script.Code)
+        } catch {
+            $global:FailedScripts += $Script.FileName
+            $Failed = $true
+        }
+    }
+    if (-not $Failed) {
+        $global:SavedScripts += [PSCustomObject]@{
+            Name = $Script.Name
+            Language = $Script.Language
+            Category = $Script.Category
+            Description = $Script.Description
+            FilePath = $Script.FilePath
+        }
+    }
+}
+
+# Display results
+if ($global:MultipleScripts) {
+    Write-Warning "The following scripts with multiple categories were saved to '- Duplicates' folder:"
+    $global:MultipleScripts | Format-Table -AutoSize
+}
+
+if ($global:FailedScripts.Count -gt 0) {
+    Write-Host "`nFailed scripts:" -ForegroundColor Red
+    $global:FailedScripts | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+}
+
+$global:SavedScripts | Select-Object Name, Language, Category, Description, FilePath | 
+    Sort-Object Category | 
+    Export-Csv -Path "$ScriptFolder\Scripts.csv" -NoTypeInformation
+
+Write-Host "`n========================================" -ForegroundColor Green
+Write-Host "Download Complete!" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Green
+Write-Host "Total scripts: $TotalScripts" -ForegroundColor Cyan
+Write-Host "Successfully saved: $($global:SavedScripts.Count)" -ForegroundColor Green
+Write-Host "Failed: $($global:FailedScripts.Count)" -ForegroundColor $(if ($global:FailedScripts.Count -gt 0) { 'Red' } else { 'Green' })
+Write-Host "Multiple categories (saved to '- Duplicates'): $($global:MultipleScripts.Count)" -ForegroundColor Yellow
+Write-Host "`nScripts saved to: $ScriptFolder" -ForegroundColor Cyan
+Write-Host "Script details exported to: $ScriptFolder\Scripts.csv" -ForegroundColor Cyan
+Write-Host "Session cached at: $env:USERPROFILE\.ninja_session.xml" -ForegroundColor Cyan
