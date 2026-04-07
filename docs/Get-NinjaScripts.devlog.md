@@ -93,11 +93,18 @@ Session cookies are cached to avoid repeated SSO/MFA prompts during the 2-hour v
 
 Alternative approaches (plaintext, base64) would expose the session cookie to anyone with filesystem access. DPAPI provides enterprise-grade protection with zero configuration.
 
-### Batch processing instead of parallel
+### PowerShell 7 parallel processing with streaming progress
 
-PowerShell 5.1 doesn't have `ForEach-Object -Parallel`. Attempted implementation using `$using:` scope in parallel blocks hit multiple syntax errors with complex expressions. Batch processing (50 scripts per batch) provides 5-6x speedup over sequential while maintaining compatibility and avoiding threading complexity.
+PowerShell 7+ uses `ForEach-Object -Parallel` with thread-safe `ConcurrentDictionary` for duplicate filename tracking and progress counting. Files are written immediately inside parallel runspaces to optimize memory usage (no code stored in `$ScriptArray`).
 
-Parallel processing with thread-safe collections (`ConcurrentBag`, `ConcurrentDictionary`) was attempted but abandoned due to PowerShell version compatibility and `$using:` limitations.
+**Critical invariant:** `$using:` scope only works inside the `-Parallel` scriptblock, NOT in the chained `ForEach-Object` on the main thread. The streaming `ForEach-Object` collects results directly into `$ScriptArray` via pipeline assignment without needing `$using:`.
+
+**Progress counter pattern:**
+- Progress updates happen ONLY in the streaming `ForEach-Object` (main thread)
+- Each result passes through once, updating the counter once
+- Avoids double-counting that occurs if counter is updated in both parallel block and streaming block
+
+PowerShell 5.1 falls back to sequential processing with file writes in a separate loop after script metadata collection.
 
 ### Duplicate category handling
 
@@ -128,7 +135,11 @@ These are the core truths the script is built around. If any of these change, th
 | Selenium EdgeOptions API varies by version | Use `AddArguments()` first, fallback to `AddAdditionalCapability()` |
 | Off-screen positioning uses `--window-position=-32000,-32000` | Starts browser hidden to avoid visual flash during setup |
 | Dynamic screen detection via `System.Windows.Forms.Screen` | Automatically detects primary monitor resolution for centering |
-| Batch size of 50 balances speed and feedback | Smaller batches = more progress updates, larger batches = fewer HTTP round-trips |
+| `$using:` scope only works in `-Parallel` block | Chained `ForEach-Object` runs on main thread - use direct pipeline assignment to `$ScriptArray` |
+| Progress counter updates ONLY in streaming block | Updating in both parallel and streaming blocks causes double-counting |
+| Files written immediately in parallel mode | Optimizes memory - no script code stored in `$ScriptArray`, only metadata |
+| ThrottleLimit of 50 for parallel processing | Balances API rate limits, memory usage, and download speed |
+| Duplicate scripts table sorted by category then name | Multi-level sort: `Sort-Object Categories, Name` for organized display |
 
 ---
 
@@ -458,6 +469,82 @@ $screenHeight = $primaryScreen.Bounds.Height
 
 ---
 
+### Progress bar not dismissing after completion
+
+Progress bar remained visible after script completion in parallel mode.
+
+**Root cause:** `Write-Progress -Completed` only dismisses the progress bar when called from the same scope that owns it. In parallel mode, `Write-Progress` was being called inside runspaces (child scopes), not the main thread. The main thread never owned the progress bar, so `-Completed` on the main thread didn't dismiss it.
+
+**Fix:** Remove all `Write-Progress` calls from inside the parallel block. Instead, stream results back to the main thread and update progress there:
+```powershell
+} -ThrottleLimit 50 | ForEach-Object {
+    $result = $_
+    # Update progress on main thread
+    $total = $ProgressCounter['completed'] + $ProgressCounter['failed']
+    $percent = [math]::Round(($total / $TotalScripts) * 100)
+    Write-Progress -Activity "Downloading Scripts" `
+        -Status "$total/$TotalScripts | $percent% Complete" `
+        -PercentComplete $percent
+    $result
+}
+
+Write-Progress -Activity "Downloading Scripts" -Completed  # Now works!
+```
+
+---
+
+### Category folder names with invalid filesystem characters
+
+Category names from API contained characters invalid for Windows folder names (`/`, `:`, `*`, `?`, `"`, `<`, `>`, `|`).
+
+**Error:** Failed to create directory with names like `"Hardware / Software"` or `"Client: Config"`.
+
+**Fix:** Sanitize category names when building folder paths:
+```powershell
+$OriginalCategoryNames = ((Get-ScriptCategory -CategoryIDs $ScriptContent.categoriesIds -CategoriesHash $CategoriesHash) -replace '[\\/:*?"<>|]', '_')
+```
+
+This preserves the original category names in the CSV export and warning messages while using sanitized names for folder creation.
+
+---
+
+### Progress counter double-counting in parallel mode
+
+Scripts were being counted twice, showing "Successfully saved: 2202" when total was 1101.
+
+**Investigation:**
+```powershell
+# Progress counter updated in parallel block
+if ($WriteSuccess) {
+    $ProgressCounter.AddOrUpdate('completed', 1, { param($k, $v) $v + 1 })
+}
+
+# ALSO updated in streaming ForEach-Object
+if (-not $result.Failed) {
+    $ProgressCounter.AddOrUpdate('completed', 1, { param($k, $v) $v + 1 })
+}
+```
+
+**Root cause:** Progress counter was being incremented twice - once inside the parallel runspace after file write, and again in the streaming `ForEach-Object` on the main thread. Each successful script was counted twice.
+
+**Fix:** Remove progress counter updates from parallel block entirely. Only update in the streaming block:
+```powershell
+} -ThrottleLimit 50 | ForEach-Object {
+    $result = $_
+    if (-not $result.Failed) {
+        $ProgressCounter.AddOrUpdate('completed', 1, { param($k, $v) $v + 1 }) | Out-Null
+    } else {
+        $ProgressCounter.AddOrUpdate('failed', 1, { param($k, $v) $v + 1 }) | Out-Null
+    }
+    # ... progress bar display ...
+    $result  # pass through to $ScriptArray
+}
+```
+
+Added `| Out-Null` to suppress the return value from `AddOrUpdate()` which was cluttering the pipeline.
+
+---
+
 ## Rejected Approaches
 
 | Approach | Why Rejected |
@@ -534,3 +621,9 @@ $screenHeight = $primaryScreen.Bounds.Height
 | 2026-04-07 | **Window positioning** - Replaced hardcoded screen resolution with dynamic detection via `System.Windows.Forms.Screen` |
 | 2026-04-07 | **Parameter cleanup** - Removed ScreenWidth/ScreenHeight parameters since detection is automatic |
 | 2026-04-07 | **Startup optimization** - Reduced browser startup delays from 10+ seconds to 2-3 seconds |
+| 2026-04-07 | **Parallel processing** - Implemented PowerShell 7+ parallel mode with streaming progress and immediate file writes |
+| 2026-04-07 | **Progress bar scope fix** - Moved progress updates to main thread to ensure proper dismissal with `-Completed` |
+| 2026-04-07 | **Progress counter fix** - Resolved double-counting issue by updating counter only in streaming block |
+| 2026-04-07 | **Category name sanitization** - Replace invalid filesystem characters in folder names while preserving originals in CSV |
+| 2026-04-07 | **Memory optimization** - Files written immediately in parallel mode, no code stored in `$ScriptArray` |
+| 2026-04-07 | **Duplicate scripts sorting** - Added multi-level sort (category A-Z, then name A-Z) for better readability |
